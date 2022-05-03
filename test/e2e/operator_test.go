@@ -23,6 +23,7 @@ import (
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/davecgh/go-spew/spew"
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	iov1 "github.com/openshift/api/operatoringress/v1"
@@ -46,6 +47,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -1985,6 +1987,25 @@ func TestHTTPHeaderCapture(t *testing.T) {
 }
 
 func TestHTTPCookieCapture(t *testing.T) {
+	podExists := func(namespace, name string, timeout time.Duration, selector labels.Selector) bool {
+		podList := &corev1.PodList{}
+		if err := wait.PollImmediate(1*time.Second, timeout, func() (bool, error) {
+			if err := kclient.List(context.TODO(), podList, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+				t.Logf("failed to list pods: %v", err)
+				return false, err
+			}
+			return true, nil
+		}); err != nil {
+			return false
+		}
+		for _, pod := range podList.Items {
+			if pod.GetNamespace() == namespace && pod.GetName() == name {
+				return true
+			}
+		}
+		return false
+	}
+
 	icName := types.NamespacedName{Namespace: operatorNamespace, Name: "cookiecapture"}
 	domain := icName.Name + "." + dnsConfig.Spec.BaseDomain
 	ic := newNodePortController(icName, domain)
@@ -2034,6 +2055,10 @@ func TestHTTPCookieCapture(t *testing.T) {
 		t.Fatalf("found no pods for ingresscontroller: %v", err)
 	}
 
+	for i := range podList.Items {
+		spew.Dump(podList.Items[i])
+	}
+
 	// Make a request to the console route.
 	routeName := types.NamespacedName{Namespace: "openshift-console", Name: "console"}
 	route := &routev1.Route{}
@@ -2077,20 +2102,22 @@ func TestHTTPCookieCapture(t *testing.T) {
 			t.Fatalf("failed to delete pod %s/%s: %v", clientPod.Namespace, clientPod.Name, err)
 		}
 	}()
-
 	// Scan the access logs to make sure the expected cookie was captured
 	// and logged.
 	kubeConfig, err := config.GetConfig()
 	if err != nil {
 		t.Fatalf("failed to get kube config: %v", err)
 	}
-	client, err := kubernetes.NewForConfig(kubeConfig)
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
 		t.Fatalf("failed to create kube client: %v", err)
 	}
 	err = wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
 		for _, pod := range podList.Items {
-			readCloser, err := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			if !podExists(pod.Namespace, pod.Name, time.Minute, selector) {
+				t.Fatalf("why did pod %v disappear", pod)
+			}
+			readCloser, err := kubeClient.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 				Container: "logs",
 				Follow:    false,
 			}).Stream(context.TODO())
